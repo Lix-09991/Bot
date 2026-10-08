@@ -1,3 +1,4 @@
+
 import re, requests, asyncio, time, sqlite3, atexit, os, random, logging
 import uuid
 import hashlib
@@ -16,6 +17,12 @@ from telegram.ext import (
 import telegram.error
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
+# ── НОВЫЕ ИМПОРТЫ (вставить ЗДЕСЬ, между импортами и логированием) ──
+import hmac
+import texts as T
+from texts import Status
+# ─────────────────────────────────────────────────────────────────
 
 # ---------- ЛОГИРОВАНИЕ ----------
 logging.basicConfig(
@@ -163,6 +170,7 @@ def get_cabinet_keyboard(user_id):
  LTC_SELECT_MAIN_METHOD, BTC_SELECT_MAIN_METHOD) = range(16)
 LEAVE_REVIEW_TEXT = 16
 TRANSGRAN_METHOD = 17
+(MANUAL_REQ_WAIT_ADMIN_TEXT,) = range(18, 19)
 
 def is_bot_disabled():
     return os.path.exists(BOT_DISABLED_FILE)
@@ -2923,12 +2931,13 @@ async def show_main_payment_choice(update, context):
     total_rub = round(base_rub * (1 + commission_percent / 100))
     context.user_data['bestmerchant_total'] = total_rub
 
-    # --- Сразу фиксируем намерение nicepay ---
-    context.user_data['selected_payment_option'] = 'nicepay'
-    context.user_data['payment_type'] = 'nicepay'
-
-    # --- Кнопки методов оплаты ---
-    buttons = []
+       # --- Кнопки методов оплаты ---
+    # ВАЖНО: "намерение" (selected_payment_option / payment_type) НЕ фиксируем заранее,
+    # потому что пользователь ещё не выбрал метод. Иначе ручной флоу
+    # сразу уйдёт в nicepay.
+    buttons = [
+        [InlineKeyboardButton("📤 Ручные реквизиты", callback_data="manual_req")],
+    ]
     for code, label in NICEPAY_METHODS.items():
         buttons.append([InlineKeyboardButton(
             label, callback_data=f"nicepay_method_{code}"
@@ -3100,33 +3109,21 @@ async def wallet_entered(update, context):
 
     option = context.user_data.get('selected_payment_option')
 
-    if option == 'ru_banks':
-        # Подтверждение для РУ-метода
-        payment_type = context.user_data.get('payment_type', 'card')
-        pt = "Реквизиты" if payment_type == 'card' else "СБП"
+    if option == 'manual':
         rub = context.user_data['rub_amount']
         crypto_str = context.user_data.get('crypto_str', f"{context.user_data['crypto_amount']:.6f}")
-        msg_text = (
-            f"📋 Подтверждение\n\n"
-            f"🪙 К получению: {crypto_str} {crypto_type}\n"
-            f"🔗 Кошелёк: {wallet}\n"
-            f"💵 К оплате: {rub:.0f} RUB\n"
-            f"💳 Метод: {pt}\n\n"
-            f"⚠️ Важно!\n\n"
-            f"После оплаты обязательно отправьте PDF-чек в этот чат.\n"
-            f"Если вы:\n"
-            f"• оплатите не ту сумму;\n"
-            f"• оплатите не с того банка;\n"
-            f"• просрочите оплату,\n"
-            f"то заявка может быть обработана с большой задержкой, а в некоторых случаях возврат денежных средств будет невозможен.\n\n"
-            f"Подтверждаете?"
-        )
         await update.message.reply_text(
-            msg_text,
+            f"📋 <b>Подтверждение заявки</b>\n\n"
+            f"🪙 К получению: <code>{crypto_str}</code> {crypto_type}\n"
+            f"🔗 Кошелёк: <code>{wallet}</code>\n"
+            f"💵 К оплате: <b>{rub:.0f} RUB</b>\n\n"
+            f"После подтверждения заявка будет создана, "   
+            f"а администратор пришлёт вам реквизиты для оплаты.\n\n"
+            f"Подтверждаете?",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_order")],
-                [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
+                [InlineKeyboardButton(T.BTN_CONFIRM, callback_data="confirm_order")],
+                [InlineKeyboardButton(T.BTN_CANCEL, callback_data="cancel")]
             ])
         )
         return LTC_CONFIRM if crypto_type == 'LTC' else BTC_CONFIRM
@@ -3207,6 +3204,23 @@ async def payment_method_callback(update, context):
     if data == "cancel":
         await query.edit_message_text("❌ Отменено.")
         return ConversationHandler.END
+
+            # ===== Ручные реквизиты =====
+        # ===== Ручные реквизиты =====
+    if data == "manual_req":
+        context.user_data['selected_payment_option'] = 'manual'
+        context.user_data['payment_type'] = 'manual'
+        await query.edit_message_text(
+            f"👛 <b>Ввод кошелька</b>\n\n"
+            f"🪙 Валюта: <b>{crypto_type}</b>\n\n"
+            f"👇 Укажите ваш {crypto_type}-кошелёк:",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(T.BTN_CANCEL, callback_data="cancel")]
+            ])
+        )
+        return LTC_WALLET if crypto_type == 'LTC' else BTC_WALLET
+
 
         # ===== BestMerchant =====
     if data.startswith("bm_"):
@@ -3536,6 +3550,9 @@ async def confirm_order(update, context):
     # Если выбран NicePay (Трансгран)
     if context.user_data.get('payment_type') == 'nicepay':
         return await confirm_order_nicepay(update, context)
+
+    if context.user_data.get('payment_type') == 'manual':
+        return await create_manual_order(update, context)
 
     # ── 1. Сначала читаем все данные из user_data
     user = query.from_user
@@ -4115,6 +4132,298 @@ async def confirm_order_nicepay(update, context):
     context.user_data.pop('bestmerchant_paymethod', None)
 
     return LTC_PROOF if crypto_type == 'LTC' else BTC_PROOF
+    
+    # ══════════════════════════════════════════════════════════════════
+# РУЧНОЙ ФЛОУ РЕКВИЗИТОВ (админ отправляет текст вручную)
+# ══════════════════════════════════════════════════════════════════
+
+async def create_manual_order(update, context):
+    """Создаёт заявку без реквизитов и уведомляет админа.
+    Пользователь ждёт, пока админ пришлёт реквизиты."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    crypto_type = context.user_data['crypto_type']
+    rub = context.user_data['rub_amount']
+    crypto_amount = context.user_data['crypto_amount']
+    wallet = context.user_data['wallet']
+    crypto_str = context.user_data.get('crypto_str', f"{crypto_amount:.6f}")
+
+    async with order_id_lock:
+        global next_order_id, orders
+        order_id = next_order_id
+        next_order_id += 1
+
+    created_at = datetime.now().isoformat()
+    orders[order_id] = {
+        'user_id': user.id,
+        'username': user.username or user.full_name,
+        'crypto_type': crypto_type,
+        'rub_amount': rub,
+        'crypto_amount': crypto_amount,
+        'wallet': wallet,
+        'payment_id': None,
+        'payment_type': 'manual',
+        'payment_details': '',
+        'market_rate': context.user_data['market_rate'],
+        'status': Status.AWAITING_REQUISITES,
+        'admin_message_id': None,
+        'proof_file_id': None,
+        'txid': None,
+        'bonus_used': context.user_data.get('bonus_used', 0),
+        'user_message_id': None,
+        'user_chat_id': query.message.chat_id,
+        'created_at': created_at,
+        'crypto_str': crypto_str,
+        'finished_at': None,
+        'network_fee': 0.0,
+        'bonus_awarded': False,
+        'bonus_refunded': False,
+    }
+    save_order(order_id)
+    context.user_data['order_id'] = order_id
+
+    user_msg = await query.edit_message_text(
+        T.ORDER_CREATED_AWAITING_REQUISITES.format(
+            order_id=order_id, crypto_type=crypto_type,
+            crypto_str=crypto_str, wallet=wallet, rub_amount=rub
+        ),
+        parse_mode='HTML',
+    )
+    orders[order_id]['user_message_id'] = user_msg.message_id
+    save_order(order_id)
+
+    admin_text = T.ADMIN_NEW_ORDER.format(
+        order_id=order_id,
+        username=f"@{user.username}" if user.username else user.full_name,
+        user_id=user.id,
+        crypto_type=crypto_type,
+        crypto_str=crypto_str,
+        rub_amount=rub,
+        wallet=wallet,
+        created_at=datetime.now().strftime('%H:%M'),
+    )
+    admin_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(T.BTN_SEND_REQUISITES, callback_data=f"admin_send_req_{order_id}")],
+        [InlineKeyboardButton(T.BTN_CANCEL_ORDER, callback_data=f"admin_cancel_{order_id}")],
+    ])
+    admin_msg = await context.bot.send_message(
+        ADMIN_ID, admin_text, parse_mode='HTML', reply_markup=admin_kb
+    )
+    orders[order_id]['admin_message_id'] = admin_msg.message_id
+    save_order(order_id)
+
+    return ConversationHandler.END
+
+
+async def admin_send_req_start(update, context):
+    """Админ нажал кнопку «Отправить реквизиты»."""
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Недостаточно прав", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+
+    order_id = int(query.data.rsplit('_', 1)[1])
+    order = orders.get(order_id)
+    if not order or order['status'] != Status.AWAITING_REQUISITES:
+        await query.answer("Заявка уже обработана", show_alert=True)
+        return ConversationHandler.END
+
+    context.user_data['admin_req_order_id'] = order_id
+    context.user_data['admin_req_chat_id'] = query.message.chat_id
+    context.user_data['admin_req_msg_id'] = query.message.message_id
+
+    await query.edit_message_text(
+        T.ADMIN_ENTER_REQUISITES.format(
+            order_id=order_id,
+            username=f"@{order['username']}",
+            user_id=order['user_id'],
+            rub_amount=order['rub_amount'],
+        ),
+        parse_mode='HTML',
+    )
+    return MANUAL_REQ_WAIT_ADMIN_TEXT
+
+
+async def admin_req_text_received(update, context):
+    """Админ ввёл текст реквизитов — пересылаем клиенту."""
+    if update.message.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    order_id = context.user_data.pop('admin_req_order_id', None)
+    if not order_id or order_id not in orders:
+        await update.message.reply_text("❌ Заявка не найдена.")
+        return ConversationHandler.END
+
+    order = orders[order_id]
+    if order['status'] != Status.AWAITING_REQUISITES:
+        await update.message.reply_text("❌ Заявка уже обработана.")
+        return ConversationHandler.END
+
+    requisites = update.message.text.strip()
+    if not requisites:
+        await update.message.reply_text("Пустой текст, попробуйте снова.")
+        return MANUAL_REQ_WAIT_ADMIN_TEXT
+
+    order['payment_details'] = requisites
+    order['status'] = Status.REQUISITES_SENT
+    save_order(order_id)
+
+    user_text = T.REQUISITES_RECEIVED.format(
+        order_id=order_id,
+        requisites=requisites,
+        rub_amount=order['rub_amount'],
+        btn_i_paid=T.BTN_I_PAID,
+    )
+    user_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(T.BTN_I_PAID, callback_data=f"user_paid_{order_id}")],
+    ])
+
+    msg_id = order.get('user_message_id')
+    chat_id = order.get('user_chat_id', order['user_id'])
+    try:
+        if msg_id:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=user_text, parse_mode='HTML', reply_markup=user_kb,
+            )
+        else:
+            sent = await context.bot.send_message(
+                chat_id, user_text, parse_mode='HTML', reply_markup=user_kb
+            )
+            order['user_message_id'] = sent.message_id
+            order['user_chat_id'] = chat_id
+            save_order(order_id)
+    except Exception as e:
+        logging.error(f"admin_req_text_received: не удалось отправить реквизиты: {e}")
+
+    admin_msg_id = order.get('admin_message_id')
+    if admin_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=ADMIN_ID, message_id=admin_msg_id,
+                text=(f"📤 Реквизиты отправлены клиенту.\n"
+                      f"Заявка #{order_id} | {order['rub_amount']:.0f} RUB\n"
+                      f"Статус: <b>Ожидает подтверждения оплаты</b>"),
+                parse_mode='HTML',
+            )
+        except Exception:
+            pass
+
+    return ConversationHandler.END
+
+
+async def user_paid_callback(update, context):
+    query = update.callback_query
+    order_id = int(query.data.rsplit('_', 1)[1])
+    order = orders.get(order_id)
+
+    if not order or order['user_id'] != query.from_user.id:
+        await query.answer("Заявка не найдена", show_alert=True)
+        return
+
+    if order['status'] != Status.REQUISITES_SENT:
+        await query.answer("Действие уже выполнено", show_alert=True)
+        return
+
+    lock = get_order_lock(order_id)
+    async with lock:
+        if order['status'] != Status.REQUISITES_SENT:
+            await query.answer("Действие уже выполнено", show_alert=True)
+            return
+        order['status'] = Status.AWAITING_PAYMENT_CHECK
+        save_order(order_id)
+
+    await query.answer("Принято")
+
+    try:
+        await query.edit_message_text(
+            T.I_PAID_AWAITING,
+            parse_mode='HTML',
+            reply_markup=None,
+        )
+    except telegram.error.BadRequest:
+        pass
+
+    admin_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(T.BTN_CONFIRM_PAYMENT, callback_data=f"admin_confirm_{order_id}")],
+        [InlineKeyboardButton(T.BTN_REJECT_PAYMENT, callback_data=f"admin_reject_{order_id}")],
+    ])
+    try:
+        await context.bot.send_message(
+            ADMIN_ID,
+            T.ADMIN_USER_PAID.format(
+                order_id=order_id,
+                username=f"@{order['username']}",
+                user_id=order['user_id'],
+                rub_amount=order['rub_amount'],
+            ),
+            parse_mode='HTML',
+            reply_markup=admin_kb,
+        )
+    except Exception as e:
+        logging.error(f"user_paid_callback: не удалось уведомить админа: {e}")
+
+
+async def admin_confirm_payment_callback(update, context):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Нет прав", show_alert=True)
+        return
+    order_id = int(query.data.rsplit('_', 1)[1])
+    order = orders.get(order_id)
+    if not order or order['status'] != Status.AWAITING_PAYMENT_CHECK:
+        await query.answer("Заявка уже обработана", show_alert=True)
+        return
+    await query.answer()
+
+    await confirm_payment_by_id(order_id)
+
+    try:
+        await query.edit_message_text(
+            f"✅ Оплата заявки #{order_id} подтверждена. Ожидаем завершения вывода…",
+            parse_mode='HTML',
+        )
+    except Exception:
+        pass
+
+
+async def admin_reject_payment_callback(update, context):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Нет прав", show_alert=True)
+        return
+    order_id = int(query.data.rsplit('_', 1)[1])
+    order = orders.get(order_id)
+    if not order or order['status'] != Status.AWAITING_PAYMENT_CHECK:
+        await query.answer("Заявка уже обработана", show_alert=True)
+        return
+    await query.answer()
+
+    order['status'] = Status.PAYMENT_REJECTED
+    save_order(order_id)
+    refund_bonus_for_order(order_id)
+
+    try:
+        await query.edit_message_text(
+            f"❌ Оплата заявки #{order_id} не подтверждена.",
+            parse_mode='HTML',
+        )
+    except Exception:
+        pass
+
+    try:
+        await context.bot.send_message(
+            order['user_id'],
+            "❌ <b>Оплата не подтверждена</b>\n\n"
+            "Если вы уверены, что оплатили — свяжитесь с поддержкой: @TeRX_Supp",
+            parse_mode='HTML',
+            reply_markup=main_keyboard,
+        )
+    except Exception:
+        pass
 
 async def bm_paid_callback(update, context):
     query = update.callback_query
@@ -5812,7 +6121,7 @@ def main():
             MessageHandler(filters.Text("LTC"), restart_ltc),
             MessageHandler(filters.Text("BTC"), restart_btc),
             MessageHandler(filters.COMMAND, cancel_by_command),
-            CallbackQueryHandler(payment_method_callback, pattern='^(ru_card|ru_sbp|bm_ru_banks|bm_transgran|noop|cancel)$'),
+            CallbackQueryHandler(payment_method_callback, pattern='^(ru_card|ru_sbp|bm_ru_banks|bm_transgran|manual_req|noop|cancel)$'),
             CallbackQueryHandler(nicepay_method_callback, pattern='^nicepay_method_'),
             MessageHandler(filters.Text("🏠 Главное меню"), handle_main_menu),
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu),
@@ -5872,9 +6181,9 @@ def main():
         ],
         BTC_SELECT_MAIN_METHOD: [
             MessageHandler(filters.Text("LTC"), restart_ltc),
-                MessageHandler(filters.Text("BTC"), restart_btc),
+            MessageHandler(filters.Text("BTC"), restart_btc),
             MessageHandler(filters.COMMAND, cancel_by_command),
-            CallbackQueryHandler(payment_method_callback, pattern='^(ru_card|ru_sbp|bm_ru_banks|bm_transgran|noop|cancel)$'),
+            CallbackQueryHandler(payment_method_callback, pattern='^(ru_card|ru_sbp|bm_ru_banks|bm_transgran|manual_req|noop|cancel)$'),
             CallbackQueryHandler(nicepay_method_callback, pattern='^nicepay_method_'),
             MessageHandler(filters.Text("🏠 Главное меню"), handle_main_menu),
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu),
@@ -5942,6 +6251,21 @@ def main():
     app.add_handler(promo_conv)
     app.add_handler(review_conv)
 
+        # ──── Ручной флоу реквизитов ────
+    manual_req_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_send_req_start, pattern='^admin_send_req_'),
+        ],
+        states={
+            MANUAL_REQ_WAIT_ADMIN_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_req_text_received),
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_by_command)],
+        allow_reentry=True,
+    )
+    app.add_handler(manual_req_conv)
+
     app.add_handler(MessageHandler(filters.Text("Кабинет"), personal_cabinet))
     app.add_handler(MessageHandler(filters.Text("Контакты"), contacts))
     app.add_handler(MessageHandler(filters.Text("Активный обмен"), active_order))
@@ -5955,6 +6279,9 @@ def main():
     app.add_handler(CallbackQueryHandler(nicepay_paid_callback, pattern='^nicepay_paid_'))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern='^cancel_order_'))
     app.add_handler(CallbackQueryHandler(cancel_active_order, pattern='^cancel_active_'))
+    app.add_handler(CallbackQueryHandler(user_paid_callback, pattern='^user_paid_'))
+    app.add_handler(CallbackQueryHandler(admin_confirm_payment_callback, pattern='^admin_confirm_'))
+    app.add_handler(CallbackQueryHandler(admin_reject_payment_callback, pattern='^admin_reject_'))
     app.add_handler(CallbackQueryHandler(bm_retry_callback, pattern='^retry_bm_order$'))
     app.add_handler(CallbackQueryHandler(to_main_menu_callback, pattern='^to_main_menu$'))
     app.add_handler(CallbackQueryHandler(confirm_payment, pattern='^confirm_payment_'))
